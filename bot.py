@@ -144,60 +144,187 @@ async def llm_recommend(indexed_events, selected_tags, user_name=""):
         return format_events_plain(indexed_events)
 
 async def llm_free_search(uid: int, user_query: str) -> str:
+    """
+    Двухэтапный подход:
+    1. ИИ парсит запрос → возвращает критерии (теги, ключевые слова, даты, бюджет)
+    2. Python фильтрует события программно по этим критериям
+    3. ИИ пишет красивый текст по уже отфильтрованным результатам
+    """
     if not OPENAI_KEY:
         return "⚠️ Режим живого поиска недоступен: не настроен OpenAI API ключ."
+
     client = AsyncOpenAI(api_key=OPENAI_KEY)
-    today = datetime.today().strftime("%Y-%m-%d")
+    today  = datetime.today()
+    today_str = today.strftime("%Y-%m-%d")
     u = get_user(uid)
     name_str = f"Имя пользователя: {u['name']}. " if u["name"] else ""
-    available = [(i, e) for i, e in enumerate(EVENTS) if i not in u["seen"]]
-    if not available:
-        u["seen"].clear()
-        available = list(enumerate(EVENTS))
-    events_json = json.dumps([{"index": i, **e} for i, e in available], ensure_ascii=False)
-    system_prompt = (
-        f"{name_str}Ты — умный помощник по досугу в Telegram-боте. Сегодня: {today}.\n"
-        "ВАЖНЕЙШЕЕ ПРАВИЛО: ты выбираешь ТОЛЬКО события из базы, которые РЕАЛЬНО подходят под запрос.\n"
-        "Если подходящих нет — верни пустой список events:[]. НЕ предлагай нерелевантные события.\n"
-        "Например: запрос 'мастер-класс' → только события с тегом masterclass. Запрос 'бесплатно' → только price=='бесплатно'.\n\n"
-        f"База событий Москвы (доступные, не показанные):\n{events_json}\n\n"
-        "Выбери до 5 строго подходящих событий. Верни ТОЛЬКО JSON без обёртки:\n"
-        '{"understood":"как понял запрос одним предложением","events":[значения поля index, макс 5],"intro":"1-2 живых предложения если есть результаты","hooks":["почему подходит (1 предл)"]}\n'
-        "Если НИЧЕГО не подходит: {\"understood\":\"...\",\"events\":[],\"intro\":\"\",\"hooks\":[]}\n\n"
-        f"Строгие правила:\n"
-        "- 'мастер-класс', 'воркшоп', 'workshop' → тег masterclass или слово в title\n"
-        "- 'бесплатно', 'free' → price=='бесплатно'\n"
-        "- 'до 500', 'недорого', 'дёшево' → price в ['бесплатно','до 500 руб.']\n"
-        f"- 'сегодня' → дата {today}, 'завтра' → следующий день, 'эта неделя' → 7 дней от {today}\n"
-        "- НЕ подменяй хакатон мастер-классом, митап — концертом. Смысл должен совпадать."
+
+    # ── Шаг 1: ИИ только парсит запрос, никаких событий не видит ─────────────
+    parse_prompt = (
+        f"Сегодня {today_str}. Пользователь написал запрос о событиях в Москве.\n"
+        "Извлеки параметры поиска и верни ТОЛЬКО JSON без обёртки:\n"
+        "{"
+        '"keywords": ["ключевые слова из запроса для поиска в title/description, например: гончарный, керамика, лепка"],'
+        '"tags": ["теги из списка: education, tech, business, startup, networking, career, art, music, science, entertainment, sport, food, free, masterclass"],'
+        '"price_max": "бесплатно|до500|до1000|любая — на основе слов типа бесплатно/дёшево/до500р",'
+        '"date_from": "YYYY-MM-DD или null",'
+        '"date_to": "YYYY-MM-DD или null",'
+        '"understood": "одно предложение — как понял запрос"'
+        "}\n\n"
+        "Правила:\n"
+        "- 'мастер-класс', 'мастерклас', 'workshop', 'воркшоп' → тег masterclass + keywords\n"
+        "- 'лекция' → тег education\n"
+        "- 'концерт', 'музыка' → тег music\n"
+        "- 'спорт', 'тренировка', 'пробежка' → тег sport\n"
+        "- 'еда', 'кулинар', 'гастро' → тег food\n"
+        "- 'бесплатно', 'free', 'даром' → price_max=бесплатно\n"
+        "- 'до 500', 'недорого', 'дёшево' → price_max=до500\n"
+        "- 'сегодня' → date_from и date_to = сегодня\n"
+        f"- 'завтра' → дата {(today + timedelta(days=1)).strftime('%Y-%m-%d')}\n"
+        f"- 'эта неделя', 'на неделе' → date_from={today_str}, date_to={(today + timedelta(days=7)).strftime('%Y-%m-%d')}\n"
+        f"- 'выходные' → ближайшие суббота-воскресенье\n"
+        "- 'в апреле' → date_from=2026-04-01, date_to=2026-04-30\n"
+        "- если дата не упомянута → date_from и date_to = null (ищем по всей базе)\n"
+        "- keywords должны быть конкретными словами из запроса, НЕ общими тегами"
     )
+
     u["history"].append({"role": "user", "content": user_query})
+
     try:
-        resp = await client.chat.completions.create(
+        # Шаг 1: парсим запрос
+        parse_resp = await client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system_prompt}, *u["history"][-8:]],
-            max_tokens=900, temperature=0.7,
+            messages=[
+                {"role": "system", "content": parse_prompt},
+                {"role": "user", "content": user_query},
+            ],
+            max_tokens=300, temperature=0.1,  # низкая температура — нужна точность
         )
-        ai = json.loads(strip_json(resp.choices[0].message.content.strip()))
-        indices = ai.get("events", [])
-        understood = ai.get("understood", "")
+        params = json.loads(strip_json(parse_resp.choices[0].message.content.strip()))
+    except Exception as e:
+        log.warning(f"llm parse error: {e}")
+        params = {"keywords": [], "tags": [], "price_max": "любая",
+                  "date_from": None, "date_to": None, "understood": user_query}
+
+    # ── Шаг 2: Python фильтрует события программно ────────────────────────────
+    keywords  = [k.lower() for k in params.get("keywords", [])]
+    req_tags  = set(params.get("tags", []))
+    price_max = params.get("price_max", "любая")
+    date_from = params.get("date_from") or today_str  # если дата не указана — от сегодня
+    date_to   = params.get("date_to")   or "2026-12-31"
+    understood = params.get("understood", "")
+
+    PRICE_ORDER = {"бесплатно": 0, "до 500 руб.": 1, "до 1000 руб.": 2, "свыше 1000 руб.": 3}
+    PRICE_LIMIT = {"бесплатно": 0, "до500": 1, "до1000": 2, "любая": 99}
+    limit = PRICE_LIMIT.get(price_max, 99)
+
+    candidates = []
+    for i, event in enumerate(EVENTS):
+        if i in u["seen"]:
+            continue
+        # Фильтр по дате
+        if not (date_from <= event["date"] <= date_to):
+            continue
+        # Фильтр по цене
+        event_price_level = PRICE_ORDER.get(event.get("price", "свыше 1000 руб."), 3)
+        if event_price_level > limit:
+            continue
+
+        score = 0
+        event_tags = set(event.get("tags", []))
+        title_lower = event["title"].lower()
+        desc_lower  = event.get("description", "").lower()
+
+        # Совпадение по тегам (основной критерий)
+        tag_matches = len(req_tags & event_tags)
+        score += tag_matches * 10
+
+        # Совпадение по ключевым словам в названии (приоритет выше)
+        kw_in_title = sum(1 for kw in keywords if kw in title_lower)
+        score += kw_in_title * 15
+
+        # Совпадение по ключевым словам в описании
+        kw_in_desc = sum(1 for kw in keywords if kw in desc_lower)
+        score += kw_in_desc * 5
+
+        # Если есть теги но нет совпадений — пропускаем полностью
+        if req_tags and tag_matches == 0 and kw_in_title == 0:
+            continue
+
+        # Если есть ключевые слова но нет совпадений нигде — пропускаем
+        if keywords and kw_in_title == 0 and kw_in_desc == 0 and tag_matches == 0:
+            continue
+
+        if score > 0:
+            candidates.append((score, i, event))
+
+    # Сортируем по релевантности, берём топ-5
+    candidates.sort(key=lambda x: (-x[0], x[2]["date"]))
+    found = [(i, e) for _, i, e in candidates[:5]]
+
+    # ── Если ничего не нашлось — честный ответ ────────────────────────────────
+    if not found:
+        date_hint = ""
+        if date_from != today_str or date_to != "2026-12-31":
+            date_hint = f" на период с {date_from} по {date_to}"
+
+        # Проверим — может есть такие события в другой период?
+        any_time = [(i, e) for i, e in enumerate(EVENTS)
+                    if (req_tags & set(e.get("tags", [])) or
+                        any(kw in e["title"].lower() for kw in keywords))]
+
+        if any_time:
+            nearest = min(any_time, key=lambda x: x[1]["date"])
+            nearest_date = nearest[1]["date"]
+            return (
+                f"🔍 <i>{understood}</i>\n\n"
+                f"😔 На запрашиваемый период{date_hint} таких событий нет.\n\n"
+                f"Ближайшее похожее — <b>{nearest[1]['title']}</b> ({nearest_date}).\n\n"
+                "Попробуй расширить период или выбери другую тему 👇"
+            )
+        else:
+            return (
+                f"🔍 <i>{understood}</i>\n\n"
+                "😔 По такому запросу событий в базе нет совсем.\n\n"
+                "Попробуй другие интересы:\n"
+                "• <i>«мастер-класс по рисованию»</i>\n"
+                "• <i>«бесплатный спорт в эти выходные»</i>\n"
+                "• <i>«концерт или выставка»</i>"
+            )
+
+    # ── Шаг 3: ИИ пишет красивый текст по уже отфильтрованным результатам ─────
+    u["seen"].update(i for i, _ in found)
+
+    events_for_ai = "\n".join([
+        f"{n+1}. {e['title']} | {e['date']} {e['time']} | {e['location']} | Цена: {e.get('price','?')}"
+        for n, (_, e) in enumerate(found)
+    ])
+
+    text_prompt = (
+        f"{name_str}Пользователь искал: {user_query}\n"
+        f"Найдено {len(found)} подходящих событий:\n{events_for_ai}\n\n"
+        "Верни ТОЛЬКО JSON без обёртки:\n"
+        '{"intro": "1-2 живых предложения — совет другу под этот конкретный запрос",'
+        '"hooks": ["почему событие подходит (1 предложение)", ...]}'
+        f"\nhooks — ровно {len(found)} штук."
+    )
+
+    try:
+        text_resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": text_prompt}],
+            max_tokens=600, temperature=0.75,
+        )
+        ai = json.loads(strip_json(text_resp.choices[0].message.content))
         u["history"].append({
             "role": "assistant",
-            "content": f"Показал: {[EVENTS[i]['title'] for i in indices if 0 <= i < len(EVENTS)]}"
+            "content": f"Показал: {[e['title'] for _, e in found]}"
         })
-        if not indices:
-            return (
-                f"🤔 <i>{understood}</i>\n\n"
-                "Ничего подходящего не нашлось.\n\nПопробуй:\n"
-                "• <i>«что-нибудь бесплатное на выходных»</i>\n"
-                "• <i>«митап по технологиям»</i>"
-            )
-        found = [(i, EVENTS[i]) for i in indices if 0 <= i < len(EVENTS)]
-        u["seen"].update(i for i, _ in found)
         return render_cards(found, ai.get("hooks", []), ai.get("intro", ""), understood)
     except Exception as e:
-        log.warning(f"llm_free_search error: {e}")
-        return "😔 Что-то пошло не так. Попробуй ещё раз."
+        log.warning(f"llm text error: {e}")
+        return render_cards(found, [], "", understood)
+
 
 async def llm_surprise(uid: int) -> str:
     u = get_user(uid)
