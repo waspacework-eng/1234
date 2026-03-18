@@ -27,9 +27,9 @@ BOT_TOKEN   = os.getenv("BOT_TOKEN")
 OPENAI_KEY  = os.getenv("OPENAI_API_KEY")        # Если пусто — LLM отключён
 
 EVENTS_FILE = "events.json"
-WELCOME_IMAGE  = "images/welcome.PNG"
-RESEARCH_IMAGE = "images/research.PNG"
-FIND_IMAGE     = "images/find.PNG"
+WELCOME_IMAGE  = "welcome.PNG"
+RESEARCH_IMAGE = "research.PNG"
+FIND_IMAGE     = "find.PNG"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
