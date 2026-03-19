@@ -233,7 +233,7 @@ python bot.py
 | 7 | IMPROVEMENTS.md — улучшения по фидбеку | ✅ |
 | 8 | Скринкаст `Team9_MoscowCultureBot_screencast.mp4` | ✅ |
 
-### Что изменилось от baseline к финальной версии
+### Что изменилось от baseline к финальной версии baseline
 
 **Baseline (этап 5):**
 - Поиск только по тегам через кнопки
