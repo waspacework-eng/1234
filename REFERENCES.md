@@ -58,7 +58,7 @@
 
 ## Телеграм-боты
 
-### [FOMO bot](https://t.me/FomotekaRobot).
+### [FOMO bot](https://t.me/FomotekaRobot)
 
 **Достоинства**:
 
